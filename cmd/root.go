@@ -91,9 +91,36 @@ func (s *savingTokenSource) Token() (*oauth2.Token, error) {
 	return token, nil
 }
 
+// resolveEnv returns the value of the first non-empty environment variable from the given names.
+func resolveEnv(names ...string) string {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func maskOrEmpty(v string) string {
+	if v == "" {
+		return "(not set)"
+	}
+	if len(v) <= 8 {
+		return "***"
+	}
+	return v[:4] + "..." + v[len(v)-4:]
+}
+
 func initService(ctx context.Context) error {
-	// 1. GOOGLE_APPLICATION_CREDENTIALS env var — service account.
-	if sa := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); sa != "" {
+	// 1. Service account env var — try multiple aliases.
+	if sa := resolveEnv(
+		"GOOGLE_APPLICATION_CREDENTIALS",
+		"GOOGLE_CREDENTIALS",
+		"GCP_APPLICATION_CREDENTIALS",
+		"GCP_CREDENTIALS",
+		"GOOGLE_SERVICE_ACCOUNT_FILE",
+		"GCLOUD_CREDENTIALS",
+	); sa != "" {
 		data, err := os.ReadFile(sa)
 		if err != nil {
 			return fmt.Errorf("reading GOOGLE_APPLICATION_CREDENTIALS file: %w", err)
@@ -125,11 +152,23 @@ func initService(ctx context.Context) error {
 
 	// 3. OAuth2 stored in config.
 	case config.AuthMethodOAuth2:
-		clientID := os.Getenv("GOOGLE_CLIENT_ID")
+		clientID := resolveEnv(
+			"GOOGLE_CLIENT_ID",
+			"GOOGLE_OAUTH_CLIENT_ID",
+			"GCP_CLIENT_ID",
+			"GCLOUD_CLIENT_ID",
+			"GOOGLE_CLIENT",
+		)
 		if clientID == "" {
 			clientID = cfg.ClientID
 		}
-		clientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
+		clientSecret := resolveEnv(
+			"GOOGLE_CLIENT_SECRET",
+			"GOOGLE_OAUTH_CLIENT_SECRET",
+			"GCP_CLIENT_SECRET",
+			"GCLOUD_CLIENT_SECRET",
+			"GOOGLE_SECRET",
+		)
 		if clientSecret == "" {
 			clientSecret = cfg.ClientSecret
 		}
