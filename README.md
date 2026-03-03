@@ -33,7 +33,12 @@ gslides auth setup --service-account /path/to/sa.json
 ```bash
 gslides auth setup --credentials /path/to/credentials.json
 # or pass --client-id and --client-secret directly
+
+# On a remote server (VPS) where no browser is available:
+gslides auth setup --credentials /path/to/credentials.json --no-browser
 ```
+
+With `--no-browser`: the CLI prints the OAuth URL. Open it in a local browser, authorize, then copy the full redirect URL from the address bar and paste it into the terminal (the page will fail to load — that's expected).
 
 Credentials are stored in:
 - macOS: `~/Library/Application Support/g-slides/config.json`
@@ -54,10 +59,11 @@ Output is **auto-detected**: JSON when stdout is piped, tables in a terminal.
 ### `gslides auth`
 
 ```bash
-gslides auth setup --service-account sa.json     # configure service account
-gslides auth setup --credentials credentials.json # configure OAuth2
-gslides auth status                               # show auth status
-gslides auth logout                               # remove saved credentials
+gslides auth setup --service-account sa.json           # configure service account
+gslides auth setup --credentials credentials.json       # configure OAuth2
+gslides auth setup --credentials c.json --no-browser   # OAuth2 on remote/VPS
+gslides auth status                                     # show auth status
+gslides auth logout                                     # remove saved credentials
 ```
 
 ### `gslides presentation`

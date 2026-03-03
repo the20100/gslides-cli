@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -25,6 +27,7 @@ var (
 	credentialsFile    string
 	clientIDFlag       string
 	clientSecretFlag   string
+	authNoBrowser      bool
 )
 
 var authSetupCmd = &cobra.Command{
@@ -47,7 +50,14 @@ var authSetupCmd = &cobra.Command{
   3. Add http://localhost:8080 as an authorized redirect URI
 
   gslides auth setup --credentials /path/to/credentials.json
-  # or provide --client-id and --client-secret flags`,
+  # or provide --client-id and --client-secret flags
+
+On a remote server (VPS) where no browser is available:
+  gslides auth setup --credentials /path/to/credentials.json --no-browser
+
+  This prints the auth URL for you to open locally. After authorizing, your
+  browser will redirect to localhost:8080 (which will fail to load — that's ok).
+  Copy the full URL from the address bar and paste it into the terminal.`,
 	RunE: runAuthSetup,
 }
 
@@ -68,6 +78,7 @@ func init() {
 	authSetupCmd.Flags().StringVar(&credentialsFile, "credentials", "", "Path to an OAuth2 credentials.json file (Desktop app)")
 	authSetupCmd.Flags().StringVar(&clientIDFlag, "client-id", "", "OAuth2 client ID")
 	authSetupCmd.Flags().StringVar(&clientSecretFlag, "client-secret", "", "OAuth2 client secret")
+	authSetupCmd.Flags().BoolVar(&authNoBrowser, "no-browser", false, "Manual auth flow for remote/VPS: print the URL, prompt for the redirect URL")
 
 	authCmd.AddCommand(authSetupCmd, authStatusCmd, authLogoutCmd)
 	rootCmd.AddCommand(authCmd)
@@ -163,52 +174,61 @@ func runAuthSetup(cmd *cobra.Command, args []string) error {
 		},
 	}
 
-	codeCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-
-	mux := http.NewServeMux()
-	server := &http.Server{Addr: ":8080", Handler: mux}
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		code := r.URL.Query().Get("code")
-		if code == "" {
-			errMsg := r.URL.Query().Get("error")
-			if errMsg == "" {
-				errMsg = "unknown error"
-			}
-			errCh <- fmt.Errorf("authorization failed: %s", errMsg)
-			fmt.Fprintf(w, "<html><body><h2>Authorization failed: %s</h2><p>You can close this tab.</p></body></html>", errMsg)
-			return
-		}
-		codeCh <- code
-		fmt.Fprintf(w, "<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to the terminal.</p></body></html>")
-	})
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- fmt.Errorf("local callback server error: %w", err)
-		}
-	}()
-
 	authURL := oauthCfg.AuthCodeURL("state", oauth2.AccessTypeOffline, oauth2.ApprovalForce)
-	fmt.Printf("\nOpening browser for authorization...\n")
-	fmt.Printf("If the browser doesn't open, visit:\n\n  %s\n\n", authURL)
-	openBrowser(authURL)
-
-	fmt.Println("Waiting for authorization (timeout: 5 minutes)...")
 
 	var code string
-	select {
-	case code = <-codeCh:
-	case err := <-errCh:
-		server.Shutdown(context.Background())
-		return err
-	case <-time.After(5 * time.Minute):
-		server.Shutdown(context.Background())
-		return fmt.Errorf("authorization timed out")
-	}
+	if authNoBrowser {
+		var err error
+		code, err = runOAuthFlowManual(authURL)
+		if err != nil {
+			return err
+		}
+	} else {
+		codeCh := make(chan string, 1)
+		errCh := make(chan error, 1)
 
-	server.Shutdown(context.Background())
+		mux := http.NewServeMux()
+		server := &http.Server{Addr: ":8080", Handler: mux}
+
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			code := r.URL.Query().Get("code")
+			if code == "" {
+				errMsg := r.URL.Query().Get("error")
+				if errMsg == "" {
+					errMsg = "unknown error"
+				}
+				errCh <- fmt.Errorf("authorization failed: %s", errMsg)
+				fmt.Fprintf(w, "<html><body><h2>Authorization failed: %s</h2><p>You can close this tab.</p></body></html>", errMsg)
+				return
+			}
+			codeCh <- code
+			fmt.Fprintf(w, "<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to the terminal.</p></body></html>")
+		})
+
+		go func() {
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("local callback server error: %w", err)
+			}
+		}()
+
+		fmt.Printf("\nOpening browser for authorization...\n")
+		fmt.Printf("If the browser doesn't open, visit:\n\n  %s\n\n", authURL)
+		openBrowser(authURL)
+
+		fmt.Println("Waiting for authorization (timeout: 5 minutes)...")
+
+		select {
+		case code = <-codeCh:
+		case err := <-errCh:
+			server.Shutdown(context.Background())
+			return err
+		case <-time.After(5 * time.Minute):
+			server.Shutdown(context.Background())
+			return fmt.Errorf("authorization timed out")
+		}
+
+		server.Shutdown(context.Background())
+	}
 
 	token, err := oauthCfg.Exchange(context.Background(), code)
 	if err != nil {
@@ -312,4 +332,35 @@ func parseCredentialsJSON(data []byte) (*credentialsJSONEntry, error) {
 		return wrapper.Web, nil
 	}
 	return nil, fmt.Errorf("could not find 'installed' or 'web' credentials in file")
+}
+
+func runOAuthFlowManual(authURL string) (string, error) {
+	fmt.Printf("\nOpen the following URL in your browser:\n\n%s\n\n", authURL)
+	fmt.Println("After authorizing, your browser will be redirected to localhost:8080.")
+	fmt.Println("That page will fail to load — that's expected on a remote server.")
+	fmt.Println("Copy the full URL from the browser's address bar and paste it below.")
+	fmt.Print("\nRedirect URL: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	rawURL, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("reading redirect URL: %w", err)
+	}
+	rawURL = strings.TrimSpace(rawURL)
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parsing redirect URL: %w", err)
+	}
+
+	if errMsg := parsed.Query().Get("error"); errMsg != "" {
+		return "", fmt.Errorf("authorization failed: %s", errMsg)
+	}
+
+	code := parsed.Query().Get("code")
+	if code == "" {
+		return "", fmt.Errorf("no authorization code found in URL — make sure you copied the full redirect URL")
+	}
+
+	return code, nil
 }
