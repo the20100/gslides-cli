@@ -1,12 +1,13 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 
 	"github.com/spf13/cobra"
+	"github.com/the20100/g-slides-cli/internal/api"
 	"github.com/the20100/g-slides-cli/internal/output"
-	slides "google.golang.org/api/slides/v1"
 )
 
 var slideCmd = &cobra.Command{
@@ -26,7 +27,7 @@ Examples:
   gslides slide get <presentation-id> <slide-object-id> --pretty`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		page, err := svc.Presentations.Pages.Get(args[0], args[1]).Do()
+		page, err := client.GetPage(args[0], args[1])
 		if err != nil {
 			return fmt.Errorf("getting slide: %w", err)
 		}
@@ -76,15 +77,7 @@ Examples:
   gslides slide thumbnail <presentation-id> <slide-id> --json`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		req := svc.Presentations.Pages.GetThumbnail(args[0], args[1])
-		if thumbnailWidth > 0 {
-			req = req.ThumbnailPropertiesThumbnailSize("CUSTOM")
-		}
-		if thumbnailMime != "" {
-			req = req.ThumbnailPropertiesMimeType(thumbnailMime)
-		}
-
-		thumb, err := req.Do()
+		thumb, err := client.GetThumbnail(args[0], args[1], thumbnailWidth, thumbnailMime)
 		if err != nil {
 			return fmt.Errorf("getting thumbnail: %w", err)
 		}
@@ -118,34 +111,45 @@ Examples:
   gslides slide add <presentation-id> --index 0 --layout BLANK`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		createSlide := &slides.CreateSlideRequest{}
+		createSlide := map[string]interface{}{}
 		if cmd.Flags().Changed("index") {
-			idx := int64(slideAddIndex)
-			createSlide.InsertionIndex = idx
+			createSlide["insertionIndex"] = slideAddIndex
 		}
 		if slideAddLayout != "" {
-			createSlide.SlideLayoutReference = &slides.LayoutReference{
-				PredefinedLayout: slideAddLayout,
+			createSlide["slideLayoutReference"] = map[string]string{
+				"predefinedLayout": slideAddLayout,
 			}
 		}
 
-		resp, err := svc.Presentations.BatchUpdate(args[0], &slides.BatchUpdatePresentationRequest{
-			Requests: []*slides.Request{
-				{CreateSlide: createSlide},
-			},
-		}).Do()
+		reqJSON, err := json.Marshal([]map[string]interface{}{
+			{"createSlide": createSlide},
+		})
+		if err != nil {
+			return fmt.Errorf("encoding request: %w", err)
+		}
+
+		resp, err := client.BatchUpdate(args[0], json.RawMessage(reqJSON))
 		if err != nil {
 			return fmt.Errorf("adding slide: %w", err)
 		}
 		if output.IsJSON(cmd) {
 			return output.PrintJSON(resp, output.IsPretty(cmd))
 		}
-		if len(resp.Replies) > 0 && resp.Replies[0].CreateSlide != nil {
-			fmt.Printf("Slide added.\n")
-			fmt.Printf("Slide ID: %s\n", resp.Replies[0].CreateSlide.ObjectId)
-		} else {
-			fmt.Println("Slide added.")
+
+		// Try to extract the new slide's object ID from the reply
+		if len(resp.Replies) > 0 {
+			var reply struct {
+				CreateSlide *struct {
+					ObjectId string `json:"objectId"`
+				} `json:"createSlide"`
+			}
+			if err := json.Unmarshal(resp.Replies[0], &reply); err == nil && reply.CreateSlide != nil {
+				fmt.Printf("Slide added.\n")
+				fmt.Printf("Slide ID: %s\n", reply.CreateSlide.ObjectId)
+				return nil
+			}
 		}
+		fmt.Println("Slide added.")
 		return nil
 	},
 }
@@ -161,13 +165,14 @@ Examples:
   gslides slide delete <presentation-id> <slide-object-id>`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		_, err := svc.Presentations.BatchUpdate(args[0], &slides.BatchUpdatePresentationRequest{
-			Requests: []*slides.Request{
-				{DeleteObject: &slides.DeleteObjectRequest{
-					ObjectId: args[1],
-				}},
-			},
-		}).Do()
+		reqJSON, err := json.Marshal([]map[string]interface{}{
+			{"deleteObject": map[string]string{"objectId": args[1]}},
+		})
+		if err != nil {
+			return fmt.Errorf("encoding request: %w", err)
+		}
+
+		_, err = client.BatchUpdate(args[0], json.RawMessage(reqJSON))
 		if err != nil {
 			return fmt.Errorf("deleting slide: %w", err)
 		}
@@ -188,25 +193,34 @@ Examples:
   gslides slide duplicate <presentation-id> <slide-id> --json`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		resp, err := svc.Presentations.BatchUpdate(args[0], &slides.BatchUpdatePresentationRequest{
-			Requests: []*slides.Request{
-				{DuplicateObject: &slides.DuplicateObjectRequest{
-					ObjectId: args[1],
-				}},
-			},
-		}).Do()
+		reqJSON, err := json.Marshal([]map[string]interface{}{
+			{"duplicateObject": map[string]string{"objectId": args[1]}},
+		})
+		if err != nil {
+			return fmt.Errorf("encoding request: %w", err)
+		}
+
+		resp, err := client.BatchUpdate(args[0], json.RawMessage(reqJSON))
 		if err != nil {
 			return fmt.Errorf("duplicating slide: %w", err)
 		}
 		if output.IsJSON(cmd) {
 			return output.PrintJSON(resp, output.IsPretty(cmd))
 		}
-		if len(resp.Replies) > 0 && resp.Replies[0].DuplicateObject != nil {
-			fmt.Printf("Slide duplicated.\n")
-			fmt.Printf("New Slide ID: %s\n", resp.Replies[0].DuplicateObject.ObjectId)
-		} else {
-			fmt.Println("Slide duplicated.")
+
+		if len(resp.Replies) > 0 {
+			var reply struct {
+				DuplicateObject *struct {
+					ObjectId string `json:"objectId"`
+				} `json:"duplicateObject"`
+			}
+			if err := json.Unmarshal(resp.Replies[0], &reply); err == nil && reply.DuplicateObject != nil {
+				fmt.Printf("Slide duplicated.\n")
+				fmt.Printf("New Slide ID: %s\n", reply.DuplicateObject.ObjectId)
+				return nil
+			}
 		}
+		fmt.Println("Slide duplicated.")
 		return nil
 	},
 }
@@ -214,9 +228,9 @@ Examples:
 // ---- slide replace-text ----
 
 var (
-	replaceTextOld         string
-	replaceTextNew         string
-	replaceTextMatchCase   bool
+	replaceTextOld       string
+	replaceTextNew       string
+	replaceTextMatchCase bool
 )
 
 var slideReplaceTextCmd = &cobra.Command{
@@ -233,26 +247,39 @@ Examples:
 			return fmt.Errorf("--old is required")
 		}
 
-		resp, err := svc.Presentations.BatchUpdate(args[0], &slides.BatchUpdatePresentationRequest{
-			Requests: []*slides.Request{
-				{ReplaceAllText: &slides.ReplaceAllTextRequest{
-					ContainsText: &slides.SubstringMatchCriteria{
-						Text:      replaceTextOld,
-						MatchCase: replaceTextMatchCase,
+		reqJSON, err := json.Marshal([]map[string]interface{}{
+			{
+				"replaceAllText": map[string]interface{}{
+					"containsText": map[string]interface{}{
+						"text":      replaceTextOld,
+						"matchCase": replaceTextMatchCase,
 					},
-					ReplaceText: replaceTextNew,
-				}},
+					"replaceText": replaceTextNew,
+				},
 			},
-		}).Do()
+		})
+		if err != nil {
+			return fmt.Errorf("encoding request: %w", err)
+		}
+
+		resp, err := client.BatchUpdate(args[0], json.RawMessage(reqJSON))
 		if err != nil {
 			return fmt.Errorf("replacing text: %w", err)
 		}
 		if output.IsJSON(cmd) {
 			return output.PrintJSON(resp, output.IsPretty(cmd))
 		}
+
 		occurrences := int64(0)
-		if len(resp.Replies) > 0 && resp.Replies[0].ReplaceAllText != nil {
-			occurrences = resp.Replies[0].ReplaceAllText.OccurrencesChanged
+		if len(resp.Replies) > 0 {
+			var reply struct {
+				ReplaceAllText *struct {
+					OccurrencesChanged int64 `json:"occurrencesChanged"`
+				} `json:"replaceAllText"`
+			}
+			if err := json.Unmarshal(resp.Replies[0], &reply); err == nil && reply.ReplaceAllText != nil {
+				occurrences = reply.ReplaceAllText.OccurrencesChanged
+			}
 		}
 		fmt.Printf("Replaced %s occurrences of %q with %q.\n",
 			strconv.FormatInt(occurrences, 10), replaceTextOld, replaceTextNew)
@@ -286,7 +313,7 @@ func init() {
 }
 
 // elementType returns a display name for a page element type.
-func elementType(el *slides.PageElement) string {
+func elementType(el *api.PageElement) string {
 	if el.Shape != nil {
 		return "shape"
 	}

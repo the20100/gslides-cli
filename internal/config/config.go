@@ -5,32 +5,22 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"time"
-)
-
-// AuthMethod identifies which authentication type is configured.
-const (
-	AuthMethodServiceAccount = "service_account"
-	AuthMethodOAuth2         = "oauth2"
 )
 
 // Config holds the persisted user configuration.
-// Supports two auth methods:
-//   - service_account: a service account JSON file (recommended for automation)
-//   - oauth2:          OAuth2 desktop app flow (for interactive use)
 type Config struct {
-	AuthMethod string `json:"auth_method"` // "service_account" or "oauth2"
-
-	// Service account fields.
-	ServiceAccountJSON string `json:"service_account_json,omitempty"`
-
-	// OAuth2 fields.
-	ClientID     string    `json:"client_id,omitempty"`
-	ClientSecret string    `json:"client_secret,omitempty"`
-	AccessToken  string    `json:"access_token,omitempty"`
-	RefreshToken string    `json:"refresh_token,omitempty"`
-	TokenType    string    `json:"token_type,omitempty"`
-	TokenExpiry  time.Time `json:"token_expiry,omitempty"`
+	// Service account credentials file path (set by: gslides auth set-credentials).
+	CredentialsFile string `json:"credentials_file,omitempty"`
+	// OAuth 2.0 client_secret.json path (set by: gslides auth set-client-secret).
+	ClientSecretFile string `json:"client_secret_file,omitempty"`
+	// OAuth 2.0 token fields (set by: gslides auth login).
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	TokenExpiry  int64  `json:"token_expiry,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
+	UserEmail    string `json:"user_email,omitempty"`
+	UserName     string `json:"user_name,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -38,10 +28,10 @@ func configPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "g-slides", "config.json"), nil
+	return filepath.Join(dir, "gslides", "config.json"), nil
 }
 
-// Load reads the config file. Returns an empty Config (not an error) if the file doesn't exist.
+// Load reads the config file. Returns empty Config (not error) if file doesn't exist.
 func Load() (*Config, error) {
 	path, err := configPath()
 	if err != nil {

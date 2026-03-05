@@ -15,7 +15,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const repoURL = "https://github.com/the20100/g-slides-cli"
+const repoURL = "https://github.com/the20100/gslides-cli"
 
 var updateCmd = &cobra.Command{
 	Use:   "update",

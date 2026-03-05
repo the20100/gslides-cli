@@ -5,333 +5,452 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/the20100/g-slides-cli/internal/config"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
+)
+
+const (
+	googleAuthURL  = "https://accounts.google.com/o/oauth2/v2/auth"
+	googleTokenURL = "https://oauth2.googleapis.com/token"
+	googleUserInfo = "https://www.googleapis.com/oauth2/v2/userinfo"
+	slidesScope    = "https://www.googleapis.com/auth/presentations"
+	// oauthLoginScope adds userinfo scopes so we can display who is logged in.
+	oauthLoginScope = slidesScope + " https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile"
 )
 
 var authCmd = &cobra.Command{
 	Use:   "auth",
-	Short: "Manage Google Slides API authentication",
+	Short: "Manage Google Slides authentication",
 }
 
-var (
-	serviceAccountFile string
-	credentialsFile    string
-	clientIDFlag       string
-	clientSecretFlag   string
-	authNoBrowser      bool
-)
+var authLoginNoBrowser bool
+var authLoginClientSecretFile string
 
-var authSetupCmd = &cobra.Command{
-	Use:   "setup",
-	Short: "Configure authentication (service account or OAuth2)",
-	Long: `Configure authentication for the Google Slides API.
+var authLoginCmd = &cobra.Command{
+	Use:   "login",
+	Short: "Log in to Google Slides via browser OAuth 2.0",
+	Long: `Opens your browser to authenticate with Google and saves the credentials.
 
-─── Option A: Service Account (recommended for automation) ─────────────────
-  1. Create a service account in Google Cloud Console
-  2. Enable the Google Slides API for your project
-  3. Download the JSON key file
+Client credentials (client_id + client_secret) are resolved in order:
+  1. GSLIDES_CLIENT_ID + GSLIDES_CLIENT_SECRET env vars
+  2. Config (set with: gslides auth set-client-secret)
+  3. GSLIDES_CLIENT_SECRET_FILE env var (path to client_secret.json)
+  4. --client-secret-file flag
+  5. Default path: $XDG_CONFIG_HOME/google/client_secret.json
+     (Linux: ~/.config/google/client_secret.json, macOS: ~/Library/Application Support/google/client_secret.json)
 
-  gslides auth setup --service-account /path/to/sa.json
-  # or set: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
-
-─── Option B: OAuth2 (for manual / interactive use) ────────────────────────
-  1. Create OAuth2 credentials (Desktop app) at:
-     https://console.cloud.google.com/apis/credentials
-  2. Enable the Google Slides API for your project
-  3. Add http://localhost:8080 as an authorized redirect URI
-
-  gslides auth setup --credentials /path/to/credentials.json
-  # or provide --client-id and --client-secret flags
+Create OAuth 2.0 credentials at: https://console.cloud.google.com/apis/credentials
+Choose "Desktop application" as the application type.
 
 On a remote server (VPS) where no browser is available:
-  gslides auth setup --credentials /path/to/credentials.json --no-browser
+  gslides auth login --no-browser`,
+	RunE: runAuthLogin,
+}
 
-  This prints the auth URL for you to open locally. After authorizing, your
-  browser will redirect to localhost:8080 (which will fail to load — that's ok).
-  Copy the full URL from the address bar and paste it into the terminal.`,
-	RunE: runAuthSetup,
+var authSetTokenCmd = &cobra.Command{
+	Use:   "set-token <access-token>",
+	Short: "Save an access token directly (no browser needed, no auto-refresh)",
+	Long: `Saves a Google Slides access token directly to the config file.
+
+Note: tokens saved this way cannot be auto-refreshed. To get a long-lived
+setup with automatic token refresh, use: gslides auth login
+
+You can also set GSLIDES_ACCESS_TOKEN as an env var for one-off use.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		token := args[0]
+		if len(token) < 8 {
+			return fmt.Errorf("token looks too short")
+		}
+		email, name, err := fetchUserInfo(token)
+		if err != nil {
+			return fmt.Errorf("token validation failed: %w", err)
+		}
+		newCfg := &config.Config{
+			AccessToken: token,
+			UserEmail:   email,
+			UserName:    name,
+		}
+		if err := config.Save(newCfg); err != nil {
+			return fmt.Errorf("saving config: %w", err)
+		}
+		fmt.Printf("Token saved — authenticated as %s (%s)\n", name, email)
+		fmt.Printf("Config: %s\n", config.Path())
+		return nil
+	},
+}
+
+var authSetClientSecretCmd = &cobra.Command{
+	Use:   "set-client-secret <path-to-client_secret.json>",
+	Short: "Save the path to a client_secret.json file for OAuth 2.0 login",
+	Long: `Save the path to a Google OAuth 2.0 client_secret.json file.
+
+Download client_secret.json from:
+  https://console.cloud.google.com/apis/credentials
+Choose "Desktop application" as the application type.
+
+Once set, you can log in without any env vars:
+  gslides auth login
+
+Default lookup path (used automatically if the file exists):
+  Linux:   ~/.config/google/client_secret.json
+  macOS:   ~/Library/Application Support/google/client_secret.json`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := args[0]
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("file not found: %s", path)
+		}
+		// Verify the file is parseable
+		if _, _, err := loadClientSecretFile(path); err != nil {
+			return fmt.Errorf("invalid client_secret.json: %w", err)
+		}
+		c, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+		c.ClientSecretFile = path
+		if err := config.Save(c); err != nil {
+			return fmt.Errorf("saving config: %w", err)
+		}
+		fmt.Printf("client_secret.json path saved to %s\n", config.Path())
+		fmt.Printf("File: %s\n", path)
+		fmt.Printf("\nRun: gslides auth login\n")
+		return nil
+	},
+}
+
+var authSetCredentialsCmd = &cobra.Command{
+	Use:   "set-credentials <path-to-service-account-json>",
+	Short: "Save a service account credentials file path to the config",
+	Long: `Save the path to a Google service account JSON key file.
+
+To create a service account:
+  1. Go to https://console.cloud.google.com/iam-admin/serviceaccounts
+  2. Create a service account and share your presentations with its email
+  3. Create a JSON key and download it
+  4. Run: gslides auth set-credentials /path/to/key.json
+
+Alternatively, set the GOOGLE_APPLICATION_CREDENTIALS env var.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := args[0]
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("credentials file not found: %s", path)
+		}
+		if err := config.Save(&config.Config{CredentialsFile: path}); err != nil {
+			return fmt.Errorf("saving config: %w", err)
+		}
+		fmt.Printf("Credentials path saved to %s\n", config.Path())
+		fmt.Printf("File: %s\n", path)
+		return nil
+	},
 }
 
 var authStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show current authentication status",
-	RunE:  runAuthStatus,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+		fmt.Printf("Config: %s\n\n", config.Path())
+
+		if v := os.Getenv("GSLIDES_ACCESS_TOKEN"); v != "" {
+			fmt.Println("Token source: GSLIDES_ACCESS_TOKEN env var (takes priority over config)")
+			fmt.Printf("Token:        %s\n", maskOrEmpty(v))
+		} else if v := resolveEnv("GOOGLE_APPLICATION_CREDENTIALS", "GSLIDES_CREDENTIALS"); v != "" {
+			fmt.Println("Source: service account credentials file (env var)")
+			fmt.Printf("File:   %s\n", v)
+		} else if c.CredentialsFile != "" {
+			fmt.Println("Source: service account credentials file (config)")
+			fmt.Printf("File:   %s\n", c.CredentialsFile)
+		} else if c.AccessToken != "" {
+			if c.UserName != "" {
+				fmt.Printf("Authenticated as: %s (%s)\n", c.UserName, c.UserEmail)
+			}
+			fmt.Printf("Token source:     config file (OAuth)\n")
+			fmt.Printf("Token:            %s\n", maskOrEmpty(c.AccessToken))
+			if c.RefreshToken != "" {
+				fmt.Println("Auto-refresh:     enabled")
+			} else {
+				fmt.Println("Auto-refresh:     disabled (no refresh token)")
+			}
+			if c.TokenExpiry > 0 {
+				expiry := time.Unix(c.TokenExpiry, 0)
+				if time.Now().Before(expiry) {
+					fmt.Printf("Token expires:    %s\n", expiry.UTC().Format("2006-01-02 15:04 UTC"))
+				} else {
+					fmt.Printf("Token expires:    expired at %s\n", expiry.UTC().Format("2006-01-02 15:04 UTC"))
+				}
+			}
+		} else {
+			fmt.Println("Status: not authenticated")
+			fmt.Printf("\nRun: gslides auth login\nOr:  export GSLIDES_ACCESS_TOKEN=<token>\nOr:  gslides auth set-credentials /path/to/sa.json\n")
+		}
+
+		// Show OAuth client credential source
+		fmt.Println()
+		clientID, _, src, _ := resolveClientCredentials("")
+		if clientID != "" {
+			fmt.Printf("OAuth client:     %s (%s)\n", maskOrEmpty(clientID), src)
+		} else {
+			fmt.Printf("OAuth client:     (not configured)\n")
+			fmt.Printf("  Set via: export GSLIDES_CLIENT_ID=...\n")
+			fmt.Printf("  Or:      gslides auth set-client-secret /path/to/client_secret.json\n")
+			if def := defaultClientSecretPath(); def != "" {
+				fmt.Printf("  Default: %s\n", def)
+			}
+		}
+		return nil
+	},
 }
 
 var authLogoutCmd = &cobra.Command{
 	Use:   "logout",
 	Short: "Remove saved credentials from the config file",
-	RunE:  runAuthLogout,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := config.Clear(); err != nil {
+			return fmt.Errorf("removing config: %w", err)
+		}
+		fmt.Println("Credentials removed from config.")
+		return nil
+	},
 }
 
 func init() {
-	authSetupCmd.Flags().StringVar(&serviceAccountFile, "service-account", "", "Path to a service account JSON key file")
-	authSetupCmd.Flags().StringVar(&credentialsFile, "credentials", "", "Path to an OAuth2 credentials.json file (Desktop app)")
-	authSetupCmd.Flags().StringVar(&clientIDFlag, "client-id", "", "OAuth2 client ID")
-	authSetupCmd.Flags().StringVar(&clientSecretFlag, "client-secret", "", "OAuth2 client secret")
-	authSetupCmd.Flags().BoolVar(&authNoBrowser, "no-browser", false, "Manual auth flow for remote/VPS: print the URL, prompt for the redirect URL")
-
-	authCmd.AddCommand(authSetupCmd, authStatusCmd, authLogoutCmd)
+	authLoginCmd.Flags().BoolVar(&authLoginNoBrowser, "no-browser", false, "Manual auth flow for remote/VPS: print the URL, prompt for the redirect URL")
+	authLoginCmd.Flags().StringVar(&authLoginClientSecretFile, "client-secret-file", "", "Path to client_secret.json (overrides default lookup)")
+	authCmd.AddCommand(authLoginCmd, authSetTokenCmd, authSetClientSecretCmd, authSetCredentialsCmd, authStatusCmd, authLogoutCmd)
 	rootCmd.AddCommand(authCmd)
 }
 
-func runAuthSetup(cmd *cobra.Command, args []string) error {
-	// ── Service account path ──────────────────────────────────────────────────
-	if serviceAccountFile != "" {
-		data, err := os.ReadFile(serviceAccountFile)
-		if err != nil {
-			return fmt.Errorf("reading service account file: %w", err)
-		}
-		var raw map[string]any
-		if err := json.Unmarshal(data, &raw); err != nil {
-			return fmt.Errorf("invalid JSON in service account file: %w", err)
-		}
-		if raw["type"] != "service_account" {
-			return fmt.Errorf("file does not appear to be a service account key (type=%q)", raw["type"])
-		}
-
-		cfg := &config.Config{
-			AuthMethod:         config.AuthMethodServiceAccount,
-			ServiceAccountJSON: string(data),
-		}
-		if err := config.Save(cfg); err != nil {
-			return fmt.Errorf("saving config: %w", err)
-		}
-		saEmail, _ := raw["client_email"].(string)
-		fmt.Printf("Service account configured: %s\n", saEmail)
-		fmt.Printf("Config saved to: %s\n", config.Path())
-		return nil
+func runAuthLogin(cmd *cobra.Command, args []string) error {
+	clientID, clientSecret, src, err := resolveClientCredentials(authLoginClientSecretFile)
+	if err != nil {
+		return fmt.Errorf("no OAuth client credentials found\n\n%w\n\nCreate credentials at: https://console.cloud.google.com/apis/credentials\nThen set: export GSLIDES_CLIENT_ID=... GSLIDES_CLIENT_SECRET=...\nOr:       gslides auth set-client-secret /path/to/client_secret.json", err)
 	}
-
-	// ── OAuth2 path ───────────────────────────────────────────────────────────
-	clientID := clientIDFlag
-	clientSecret := clientSecretFlag
-
-	if credentialsFile != "" {
-		data, err := os.ReadFile(credentialsFile)
-		if err != nil {
-			return fmt.Errorf("reading credentials file: %w", err)
-		}
-		creds, err := parseCredentialsJSON(data)
-		if err != nil {
-			return fmt.Errorf("parsing credentials.json: %w", err)
-		}
-		clientID = creds.ClientID
-		clientSecret = creds.ClientSecret
-	}
-
-	if clientID == "" {
-		clientID = os.Getenv("GOOGLE_CLIENT_ID")
-	}
-	if clientSecret == "" {
-		clientSecret = os.Getenv("GOOGLE_CLIENT_SECRET")
-	}
-
-	if clientID == "" || clientSecret == "" {
-		if existing, _ := config.Load(); existing != nil {
-			if clientID == "" {
-				clientID = existing.ClientID
-			}
-			if clientSecret == "" {
-				clientSecret = existing.ClientSecret
-			}
-		}
-	}
-
-	if clientID == "" {
-		fmt.Print("Enter OAuth2 Client ID: ")
-		fmt.Scan(&clientID)
-	}
-	if clientSecret == "" {
-		fmt.Print("Enter OAuth2 Client Secret: ")
-		fmt.Scan(&clientSecret)
-	}
-
-	clientID = strings.TrimSpace(clientID)
-	clientSecret = strings.TrimSpace(clientSecret)
-
-	if clientID == "" || clientSecret == "" {
-		return fmt.Errorf("client ID and secret are required for OAuth2 setup")
-	}
-
-	oauthCfg := &oauth2.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		Endpoint:     google.Endpoint,
-		RedirectURL:  "http://localhost:8080",
-		Scopes: []string{
-			"https://www.googleapis.com/auth/presentations",
-			"https://www.googleapis.com/auth/drive.file",
-		},
-	}
-
-	authURL := oauthCfg.AuthCodeURL("state", oauth2.AccessTypeOffline, oauth2.ApprovalForce)
+	fmt.Printf("Using client credentials from: %s\n", src)
 
 	var code string
-	if authNoBrowser {
+	var redirectURI string
+
+	if authLoginNoBrowser {
+		redirectURI = "http://localhost:8080"
+		authURL := buildAuthURL(clientID, redirectURI)
 		var err error
 		code, err = runOAuthFlowManual(authURL)
 		if err != nil {
 			return err
 		}
 	} else {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return fmt.Errorf("finding free port: %w", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		redirectURI = fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+
 		codeCh := make(chan string, 1)
 		errCh := make(chan error, 1)
 
 		mux := http.NewServeMux()
-		server := &http.Server{Addr: ":8080", Handler: mux}
-
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			code := r.URL.Query().Get("code")
+		mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+			q := r.URL.Query()
+			if errMsg := q.Get("error"); errMsg != "" {
+				errCh <- fmt.Errorf("OAuth error: %s — %s", errMsg, q.Get("error_description"))
+				http.Error(w, "Authentication failed. You may close this tab.", http.StatusBadRequest)
+				return
+			}
+			code := q.Get("code")
 			if code == "" {
-				errMsg := r.URL.Query().Get("error")
-				if errMsg == "" {
-					errMsg = "unknown error"
-				}
-				errCh <- fmt.Errorf("authorization failed: %s", errMsg)
-				fmt.Fprintf(w, "<html><body><h2>Authorization failed: %s</h2><p>You can close this tab.</p></body></html>", errMsg)
+				errCh <- fmt.Errorf("no code returned in callback")
+				http.Error(w, "No code received. You may close this tab.", http.StatusBadRequest)
 				return
 			}
 			codeCh <- code
-			fmt.Fprintf(w, "<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to the terminal.</p></body></html>")
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:40px">
+<h2>Authentication successful!</h2>
+<p>You may close this tab and return to the terminal.</p>
+</body></html>`)
 		})
 
+		srv := &http.Server{Handler: mux}
 		go func() {
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				errCh <- fmt.Errorf("local callback server error: %w", err)
+			if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				select {
+				case errCh <- fmt.Errorf("callback server error: %w", err):
+				default:
+				}
 			}
 		}()
 
-		fmt.Printf("\nOpening browser for authorization...\n")
-		fmt.Printf("If the browser doesn't open, visit:\n\n  %s\n\n", authURL)
+		authURL := buildAuthURL(clientID, redirectURI)
+		fmt.Printf("\nOpening browser for Google authentication...\n")
+		fmt.Printf("If the browser does not open, visit:\n  %s\n\n", authURL)
 		openBrowser(authURL)
-
-		fmt.Println("Waiting for authorization (timeout: 5 minutes)...")
+		fmt.Printf("Waiting for callback on http://127.0.0.1:%d/callback ...\n", port)
 
 		select {
 		case code = <-codeCh:
-		case err := <-errCh:
-			server.Shutdown(context.Background())
+		case err = <-errCh:
+			shutdownServer(srv)
 			return err
 		case <-time.After(5 * time.Minute):
-			server.Shutdown(context.Background())
-			return fmt.Errorf("authorization timed out")
+			shutdownServer(srv)
+			return fmt.Errorf("timed out waiting for OAuth callback (5 minutes)")
 		}
-
-		server.Shutdown(context.Background())
+		shutdownServer(srv)
 	}
 
-	token, err := oauthCfg.Exchange(context.Background(), code)
+	fmt.Println("Exchanging authorization code for tokens...")
+	accessToken, refreshToken, expiry, err := exchangeCode(code, clientID, clientSecret, redirectURI)
 	if err != nil {
-		return fmt.Errorf("exchanging code for token: %w", err)
+		return fmt.Errorf("exchanging code: %w", err)
 	}
 
-	cfg := &config.Config{
-		AuthMethod:   config.AuthMethodOAuth2,
+	fmt.Println("Fetching user info...")
+	email, name, err := fetchUserInfo(accessToken)
+	if err != nil {
+		return fmt.Errorf("fetching user info: %w", err)
+	}
+
+	newCfg := &config.Config{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		TokenExpiry:  expiry,
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		AccessToken:  token.AccessToken,
-		RefreshToken: token.RefreshToken,
-		TokenType:    token.TokenType,
-		TokenExpiry:  token.Expiry,
+		UserEmail:    email,
+		UserName:     name,
 	}
-	if err := config.Save(cfg); err != nil {
+	if err := config.Save(newCfg); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
 
-	fmt.Printf("\nAuthentication successful! Config saved to:\n  %s\n", config.Path())
+	fmt.Printf("\nAuthenticated as %s (%s)\n", name, email)
+	fmt.Printf("Auto-refresh: enabled\n")
+	fmt.Printf("Config saved to: %s\n", config.Path())
 	return nil
 }
 
-func runAuthStatus(cmd *cobra.Command, args []string) error {
-	cfg, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("loading config: %w", err)
-	}
-
-	fmt.Printf("Config: %s\n\n", config.Path())
-
-	if sa := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); sa != "" {
-		fmt.Printf("Auth method: service account (GOOGLE_APPLICATION_CREDENTIALS)\n")
-		fmt.Printf("File:        %s\n", sa)
-		return nil
-	}
-
-	switch cfg.AuthMethod {
-	case config.AuthMethodServiceAccount:
-		fmt.Println("Auth method: service account")
-		var raw map[string]any
-		if err := json.Unmarshal([]byte(cfg.ServiceAccountJSON), &raw); err == nil {
-			fmt.Printf("Account:     %s\n", raw["client_email"])
-			fmt.Printf("Project:     %s\n", raw["project_id"])
-		}
-	case config.AuthMethodOAuth2:
-		fmt.Println("Auth method: OAuth2")
-		if os.Getenv("GOOGLE_CLIENT_ID") != "" {
-			fmt.Println("Client ID:   (from GOOGLE_CLIENT_ID env var)")
-		} else {
-			fmt.Printf("Client ID:   %s\n", maskString(cfg.ClientID))
-		}
-		if cfg.RefreshToken != "" || cfg.AccessToken != "" {
-			fmt.Println("Status:      authenticated")
-			if !cfg.TokenExpiry.IsZero() {
-				if cfg.TokenExpiry.Before(time.Now()) {
-					fmt.Println("Token:       expired (will refresh automatically)")
-				} else {
-					fmt.Printf("Token:       valid until %s\n", cfg.TokenExpiry.Format(time.RFC3339))
-				}
-			}
-		} else {
-			fmt.Println("Status:      not authenticated — run: gslides auth setup")
-		}
-	default:
-		fmt.Println("Auth method: not configured")
-		fmt.Println("\nRun: gslides auth setup --service-account sa.json")
-		fmt.Println("Or:  gslides auth setup --credentials credentials.json")
-	}
-	return nil
+// clientSecretJSON is the structure of a Google OAuth 2.0 client_secret.json file.
+type clientSecretJSON struct {
+	Installed *clientSecretApp `json:"installed"`
+	Web       *clientSecretApp `json:"web"`
 }
 
-func runAuthLogout(cmd *cobra.Command, args []string) error {
-	if err := config.Clear(); err != nil {
-		return fmt.Errorf("removing config: %w", err)
-	}
-	fmt.Println("Credentials removed from config.")
-	return nil
-}
-
-// credentialsJSONEntry holds the client credentials within a credentials.json file.
-type credentialsJSONEntry struct {
+type clientSecretApp struct {
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
 }
 
-type credentialsJSONFile struct {
-	Installed *credentialsJSONEntry `json:"installed"`
-	Web       *credentialsJSONEntry `json:"web"`
+// loadClientSecretFile parses a client_secret.json and returns clientID, clientSecret.
+func loadClientSecretFile(path string) (string, string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Errorf("reading %s: %w", path, err)
+	}
+	var f clientSecretJSON
+	if err := json.Unmarshal(data, &f); err != nil {
+		return "", "", fmt.Errorf("parsing client_secret.json: %w", err)
+	}
+	app := f.Installed
+	if app == nil {
+		app = f.Web
+	}
+	if app == nil {
+		return "", "", fmt.Errorf("no 'installed' or 'web' section in %s", path)
+	}
+	if app.ClientID == "" || app.ClientSecret == "" {
+		return "", "", fmt.Errorf("missing client_id or client_secret in %s", path)
+	}
+	return app.ClientID, app.ClientSecret, nil
 }
 
-func parseCredentialsJSON(data []byte) (*credentialsJSONEntry, error) {
-	var wrapper credentialsJSONFile
-	if err := json.Unmarshal(data, &wrapper); err != nil {
-		return nil, err
+// defaultClientSecretPath returns the OS-specific default path for client_secret.json.
+func defaultClientSecretPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
 	}
-	if wrapper.Installed != nil {
-		return wrapper.Installed, nil
+	return filepath.Join(dir, "google", "client_secret.json")
+}
+
+// resolveClientCredentials returns clientID, clientSecret, source description, and error.
+// flagFile is the value of --client-secret-file flag (may be empty).
+// Resolution order:
+//  1. GSLIDES_CLIENT_ID + GSLIDES_CLIENT_SECRET env vars
+//  2. Config stored ClientID + ClientSecret
+//  3. GSLIDES_CLIENT_SECRET_FILE env var → parse file
+//  4. flagFile (--client-secret-file flag) → parse file
+//  5. Config ClientSecretFile → parse file
+//  6. Default path $UserConfigDir/google/client_secret.json (if exists)
+func resolveClientCredentials(flagFile string) (clientID, clientSecret, source string, err error) {
+	// 1. Direct env vars
+	clientID = os.Getenv("GSLIDES_CLIENT_ID")
+	clientSecret = os.Getenv("GSLIDES_CLIENT_SECRET")
+	if clientID != "" && clientSecret != "" {
+		return clientID, clientSecret, "env vars (GSLIDES_CLIENT_ID / GSLIDES_CLIENT_SECRET)", nil
 	}
-	if wrapper.Web != nil {
-		return wrapper.Web, nil
+
+	// 2. Config stored values
+	if c, err2 := config.Load(); err2 == nil && c != nil {
+		if clientID == "" {
+			clientID = c.ClientID
+		}
+		if clientSecret == "" {
+			clientSecret = c.ClientSecret
+		}
+		if clientID != "" && clientSecret != "" {
+			return clientID, clientSecret, "config file (stored credentials)", nil
+		}
+
+		// 3. GSLIDES_CLIENT_SECRET_FILE env var
+		if path := os.Getenv("GSLIDES_CLIENT_SECRET_FILE"); path != "" {
+			if id, sec, err2 := loadClientSecretFile(path); err2 == nil {
+				return id, sec, "GSLIDES_CLIENT_SECRET_FILE → " + path, nil
+			}
+		}
+
+		// 4. --client-secret-file flag
+		if flagFile != "" {
+			if id, sec, err2 := loadClientSecretFile(flagFile); err2 == nil {
+				return id, sec, "--client-secret-file → " + flagFile, nil
+			}
+		}
+
+		// 5. Config ClientSecretFile
+		if c.ClientSecretFile != "" {
+			if id, sec, err2 := loadClientSecretFile(c.ClientSecretFile); err2 == nil {
+				return id, sec, "config client_secret_file → " + c.ClientSecretFile, nil
+			}
+		}
 	}
-	return nil, fmt.Errorf("could not find 'installed' or 'web' credentials in file")
+
+	// 6. Default path
+	if def := defaultClientSecretPath(); def != "" {
+		if _, statErr := os.Stat(def); statErr == nil {
+			if id, sec, err2 := loadClientSecretFile(def); err2 == nil {
+				return id, sec, "default path → " + def, nil
+			}
+		}
+	}
+
+	return "", "", "", fmt.Errorf("no client credentials found")
 }
 
 func runOAuthFlowManual(authURL string) (string, error) {
@@ -363,4 +482,108 @@ func runOAuthFlowManual(authURL string) (string, error) {
 	}
 
 	return code, nil
+}
+
+func buildAuthURL(clientID, redirectURI string) string {
+	params := url.Values{}
+	params.Set("client_id", clientID)
+	params.Set("redirect_uri", redirectURI)
+	params.Set("scope", oauthLoginScope)
+	params.Set("response_type", "code")
+	params.Set("access_type", "offline")
+	params.Set("prompt", "consent")
+	return googleAuthURL + "?" + params.Encode()
+}
+
+func exchangeCode(code, clientID, clientSecret, redirectURI string) (string, string, int64, error) {
+	params := url.Values{}
+	params.Set("code", code)
+	params.Set("client_id", clientID)
+	params.Set("client_secret", clientSecret)
+	params.Set("redirect_uri", redirectURI)
+	params.Set("grant_type", "authorization_code")
+
+	resp, err := http.PostForm(googleTokenURL, params)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("reading token response: %w", err)
+	}
+
+	var result struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Error        string `json:"error"`
+		ErrorDesc    string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", "", 0, fmt.Errorf("parsing token response: %w", err)
+	}
+	if result.Error != "" {
+		return "", "", 0, fmt.Errorf("OAuth error: %s — %s", result.Error, result.ErrorDesc)
+	}
+	if result.AccessToken == "" {
+		return "", "", 0, fmt.Errorf("no access_token in response: %s", string(body))
+	}
+
+	expiry := time.Now().Unix() + result.ExpiresIn
+	return result.AccessToken, result.RefreshToken, expiry, nil
+}
+
+func fetchUserInfo(token string) (email, name string, err error) {
+	req, err := http.NewRequest(http.MethodGet, googleUserInfo, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("userinfo request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("reading userinfo response: %w", err)
+	}
+
+	var result struct {
+		Email string `json:"email"`
+		Name  string `json:"name"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", "", fmt.Errorf("parsing userinfo response: %w", err)
+	}
+	if result.Error != nil {
+		return "", "", fmt.Errorf("userinfo error: %s", result.Error.Message)
+	}
+	return result.Email, result.Name, nil
+}
+
+func openBrowser(u string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", u)
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", u)
+	default:
+		cmd = exec.Command("xdg-open", u)
+	}
+	_ = cmd.Start()
+}
+
+func shutdownServer(srv *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
 }

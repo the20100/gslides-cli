@@ -3,11 +3,11 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/the20100/g-slides-cli/internal/output"
-	slides "google.golang.org/api/slides/v1"
 )
 
 var presentationCmd = &cobra.Command{
@@ -27,9 +27,7 @@ Examples:
   gslides presentation create "Q4 Review" --json`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		p, err := svc.Presentations.Create(&slides.Presentation{
-			Title: args[0],
-		}).Do()
+		p, err := client.CreatePresentation(args[0])
 		if err != nil {
 			return fmt.Errorf("creating presentation: %w", err)
 		}
@@ -56,7 +54,7 @@ Examples:
   gslides presentation get <id> --pretty`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		p, err := svc.Presentations.Get(args[0]).Do()
+		p, err := client.GetPresentation(args[0])
 		if err != nil {
 			return fmt.Errorf("getting presentation: %w", err)
 		}
@@ -88,7 +86,7 @@ Examples:
   gslides presentation slides <id> --json`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		p, err := svc.Presentations.Get(args[0]).Do()
+		p, err := client.GetPresentation(args[0])
 		if err != nil {
 			return fmt.Errorf("getting presentation: %w", err)
 		}
@@ -163,23 +161,28 @@ Examples:
 				return fmt.Errorf("reading file: %w", err)
 			}
 		} else {
-			data, err = os.ReadFile("/dev/stdin")
+			data, err = io.ReadAll(os.Stdin)
 			if err != nil {
 				return fmt.Errorf("reading stdin: %w", err)
 			}
 		}
 
-		var requests []*slides.Request
-		if err := json.Unmarshal(data, &requests); err != nil {
+		// Validate the JSON is an array
+		var rawRequests json.RawMessage
+		if err := json.Unmarshal(data, &rawRequests); err != nil {
 			return fmt.Errorf("parsing requests JSON: %w", err)
 		}
-		if len(requests) == 0 {
+
+		// Verify it's a non-empty array
+		var check []json.RawMessage
+		if err := json.Unmarshal(rawRequests, &check); err != nil {
+			return fmt.Errorf("requests must be a JSON array: %w", err)
+		}
+		if len(check) == 0 {
 			return fmt.Errorf("no requests found in JSON input")
 		}
 
-		resp, err := svc.Presentations.BatchUpdate(args[0], &slides.BatchUpdatePresentationRequest{
-			Requests: requests,
-		}).Do()
+		resp, err := client.BatchUpdate(args[0], rawRequests)
 		if err != nil {
 			return fmt.Errorf("batch update failed: %w", err)
 		}
